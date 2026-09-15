@@ -1,0 +1,5 @@
+# Training stack. Deliberately small: no HF transformers, no accelerate,
+# no wandb. Everything here runs unchanged on Colab and Kaggle.
+torch>=2.1
+numpy>=1.24
+tokenizers>=0.15

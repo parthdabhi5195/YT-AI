@@ -1,0 +1,14 @@
+# Data and model artifacts are far too large for git.
+data/
+training/out/
+training/corpus/
+training/*.bin
+training/*.json.tok
+*.ipynb_checkpoints
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.DS_Store

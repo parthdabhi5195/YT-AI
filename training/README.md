@@ -144,8 +144,23 @@ is a small change.
 **Four departures from nanoGPT**, all documented inline in `model.py`: RoPE
 instead of learned position embeddings (saves 197k params, ~1.4% of budget),
 RMSNorm instead of LayerNorm, SwiGLU instead of the 4x GELU MLP (identical
-parameter count, reliably lower loss), and no biases. `--legacy-gpt2` restores
-the GPT-2 shapes if you want to A/B against the reference notebooks.
+parameter count, reliably lower loss), and no biases.
+
+**You can have the plain GPT-2 architecture instead.** `--legacy-gpt2 --bias`
+gives you LayerNorm, the 4x GELU MLP, learned position embeddings and biases --
+i.e. exactly what nanoGPT and the reference notebook use:
+
+```bash
+python training/train.py --corpus training/corpus --preset slm_15m \
+    --legacy-gpt2 --bias --out-dir training/out/legacy --epochs 2
+```
+
+At the same vocabulary and block size the two are within 1.6% on parameter
+count (13.77M vs 13.99M) and have an identical 10.6M-parameter block stack.
+The architecture is a small effect. What is *not* small, and what the flags
+above deliberately do not change, is the 8k vocabulary, block_size 512, the
+`<|endoftext|>` separator, the by-template split and the token budget. Those
+are the decisions that matter; pick either architecture under them.
 
 ---
 

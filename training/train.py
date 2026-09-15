@@ -186,6 +186,11 @@ def main():
     ap.add_argument("--legacy-gpt2", action="store_true",
                     help="LayerNorm + GELU MLP + learned positions, i.e. the "
                          "nanoGPT/GPT-2 shapes, for A/B comparison.")
+    ap.add_argument("--bias", action="store_true",
+                    help="Biases on every Linear and LayerNorm. GPT-2 has them; "
+                         "they cost a few thousand parameters and measurably do "
+                         "nothing. Use with --legacy-gpt2 to match the "
+                         "reference notebook exactly.")
     # optimisation
     ap.add_argument("--batch-size", type=int, default=32, help="Micro-batch per step.")
     ap.add_argument("--grad-accum", type=int, default=4,
@@ -249,7 +254,7 @@ def main():
         if v is not None:
             kw[k] = v
     cfg = GPTConfig(vocab_size=meta["vocab_size"], dropout=args.dropout,
-                    legacy_gpt2=args.legacy_gpt2, **kw)
+                    legacy_gpt2=args.legacy_gpt2, bias=args.bias, **kw)
 
     data = Data(args.corpus, cfg.block_size, device, device_type)
     if "val_new_templates" not in data.paths:

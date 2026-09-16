@@ -78,8 +78,9 @@ def pick_dtype(requested, device):
         # bf16 support. Asking for it there fails or silently falls back, so
         # check rather than assume.
         return "bfloat16" if torch.cuda.is_bf16_supported() else "float16"
-    # MPS autocast is still uneven; fp32 is slower but trustworthy, and the
-    # Mac is for smoke tests anyway.
+    # Apple Silicon: fp32 is the trustworthy default, but bfloat16 is roughly
+    # twice as fast and works on recent torch. Pass --dtype bfloat16 to take
+    # it; if loss goes NaN, come back to float32.
     return "float32"
 
 
@@ -285,7 +286,9 @@ def main():
         args.weight_decay, args.lr, (args.beta1, args.beta2), device_type)
     # GradScaler only matters for fp16: fp16 gradients underflow to zero
     # without loss scaling. bf16 has fp32's exponent range and needs none.
-    scaler = torch.amp.GradScaler(device_type, enabled=(dtype == "float16"))
+    use_scaler = (dtype == "float16" and device_type == "cuda")
+    scaler = torch.amp.GradScaler("cuda" if device_type == "cuda" else "cpu",
+                                  enabled=use_scaler)
 
     step, tokens_seen, best_val = 0, 0, float("inf")
     ckpt_path = out_dir / "ckpt.pt"
@@ -319,7 +322,10 @@ def main():
 
     amp_dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16,
                  "float32": torch.float32}[dtype]
-    ctx = (nullcontext() if device_type != "cuda" or dtype == "float32"
+    # Autocast on whatever device we are on, not just CUDA. Restricting this
+    # to CUDA meant --dtype bfloat16 was silently ignored on Apple Silicon,
+    # costing roughly half the achievable throughput there.
+    ctx = (nullcontext() if dtype == "float32"
            else torch.amp.autocast(device_type=device_type, dtype=amp_dtype))
 
     def save(path, extra=None):

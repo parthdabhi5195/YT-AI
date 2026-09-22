@@ -5,6 +5,9 @@ import time
 import random
 import logging
 import hashlib
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 import requests
 import html
 import yt_dlp
@@ -16,7 +19,6 @@ from deepmultilingualpunctuation import PunctuationModel
 BASE_DIR = r"C:\Users\parth\Desktop\Youtube\YouTube Account (TheUnfilteredTales)\Revived\RequestedReads"
 LOG_FILE = os.path.join(BASE_DIR, "scraper.log")
 
-# --- Webshare.io Rotating Residential Proxy ---
 PROXY_USER = os.environ.get("WEBSHARE_USER", "username")
 PROXY_PASS = os.environ.get("WEBSHARE_PASS", "password")
 PROXY_HOST = "p.webshare.io"
@@ -25,12 +27,16 @@ PROXY_URL = f"http://{PROXY_USER}:{PROXY_PASS}@{PROXY_HOST}:{PROXY_PORT}"
 
 CHANNELS = [
     "https://www.youtube.com/@Requestedreads/shorts",
-    # Add more channels here
 ]
 
 MIN_VIEWS = 50_000
 
-# Accepted English subtitle-track key prefixes, in priority order.
+# How many videos to process concurrently. Each one opens its own proxy
+# session, so this is bounded by your Webshare plan's concurrent-connection
+# limit -- check your plan/dashboard before raising this. Start low, watch
+# the error rate in scraper.log for a while, then increase.
+MAX_WORKERS = 6
+
 ENGLISH_KEYS_PRIORITY = ("en", "en-orig", "en-US", "en-GB", "en-CA", "en-AU")
 
 # ==============================================================================
@@ -40,16 +46,16 @@ def setup_logging():
     os.makedirs(BASE_DIR, exist_ok=True)
     logger = logging.getLogger("scraper")
     logger.setLevel(logging.INFO)
-    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%H:%M:%S")
-    
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(threadName)s: %(message)s", "%H:%M:%S")
+
     stream = logging.StreamHandler()
     stream.setFormatter(fmt)
     logger.addHandler(stream)
-    
+
     file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
     file_handler.setFormatter(fmt)
     logger.addHandler(file_handler)
-    
+
     return logger
 
 log = setup_logging()
@@ -58,11 +64,12 @@ log.info("Loading punctuation restoration model... This may take a moment.")
 punct_model = PunctuationModel()
 log.info("Punctuation model loaded successfully.")
 
+write_lock = threading.Lock()
+
 # ==============================================================================
 # DATA SERIALIZATION & STATE
 # ==============================================================================
 def load_processed_ids(filepath):
-    """Loads processed Video IDs into an O(1) set from the JSONL file."""
     processed = set()
     if os.path.exists(filepath):
         with open(filepath, 'r', encoding='utf-8') as f:
@@ -77,26 +84,22 @@ def load_processed_ids(filepath):
     return processed
 
 def append_to_jsonl(filepath, record):
-    """Incrementally writes a single record to prevent data loss on crash."""
-    with open(filepath, 'a', encoding='utf-8') as f:
-        f.write(json.dumps(record, ensure_ascii=False) + '\n')
+    with write_lock:
+        with open(filepath, 'a', encoding='utf-8') as f:
+            f.write(json.dumps(record, ensure_ascii=False) + '\n')
 
 # ==============================================================================
 # PROXY HELPERS
 # ==============================================================================
 def sticky_proxy_for(video_id: str) -> str:
-    """
-    Plain rotating proxy by default. Pass a video ID as sticky_key to pin
-    that video's metadata + subtitle requests to the same residential IP.
-    """
+    """Pins one video's metadata + subtitle request to the same exit IP."""
     numeric_session = int(hashlib.md5(video_id.encode()).hexdigest()[:8], 16) % 1000000
     return f"http://{PROXY_USER}-us-{numeric_session}:{PROXY_PASS}@{PROXY_HOST}:{PROXY_PORT}"
 
 # ==============================================================================
 # EXTRACTION & CLEANING
 # ==============================================================================
-def _find_english_track(subs: dict, auto_subs: dict):
-    """Returns (track_list, source_label) for the best available English track."""
+def _find_english_track(subs, auto_subs):
     for source, label in ((subs, "manual"), (auto_subs, "auto")):
         if not source:
             continue
@@ -109,17 +112,15 @@ def _find_english_track(subs: dict, auto_subs: dict):
     return None, None
 
 def fetch_transcript_in_memory(info, proxy_url):
-    """Fetches JSON3 transcript via requests using the rotating sticky proxy."""
     subs = info.get('subtitles', {}) or {}
     auto_subs = info.get('automatic_captions', {}) or {}
     target_sub, source_label = _find_english_track(subs, auto_subs)
-    
+
     if not target_sub:
         return None
 
     json3_entry = next((s for s in target_sub if s.get('ext') == 'json3'), None)
     if not json3_entry:
-        log.debug("No json3 track available (source=%s)", source_label)
         return None
 
     sub_url = json3_entry['url']
@@ -136,44 +137,141 @@ def fetch_transcript_in_memory(info, proxy_url):
                 try:
                     data = response.json()
                 except ValueError:
-                    log.warning("Subtitle response wasn't valid JSON (source=%s)", source_label)
                     return None
-                
+
                 lines = []
                 for event in data.get('events', []):
                     if 'segs' not in event:
                         continue
                     segment_text = ''.join(s.get('utf8', '') for s in event['segs'])
-                    
-                    # Clean the text: remove brackets, fix spacing, unescape HTML
                     clean_text = re.sub(r'\[.*?\]|\(.*?\)', '', segment_text)
                     clean_text = re.sub(r'\s+', ' ', clean_text).strip()
                     clean_text = html.unescape(clean_text)
-                    
                     if clean_text:
                         lines.append(clean_text)
-                        
-                final_text = " ".join(lines)
-                
-                # Restore punctuation if the string is not empty
-                if final_text.strip():
-                    return punct_model.restore_punctuation(final_text)
-                return None
-                
-            log.debug("Subtitle fetch got HTTP %s (attempt %d)", response.status_code, attempt)
-            time.sleep(2 ** attempt + random.uniform(1.0, 3.0))
-        except requests.RequestException as e:
-            log.debug("Subtitle fetch error: %s (attempt %d)", e, attempt)
-            time.sleep(1.5)
-            
+
+                return " ".join(lines) or None
+
+            # Back off on ANY non-200, not just 429. Capped shorter than
+            # before -- this is a scraper, not a polite playback client, and
+            # a full 3-attempt backoff was previously eating 15-20+ seconds
+            # per failed video for nothing.
+            time.sleep(min(2 ** attempt, 6) + random.uniform(0.5, 1.5))
+        except requests.RequestException:
+            time.sleep(1.0)
+
     return None
+
+# ==============================================================================
+# PER-VIDEO WORKER (runs inside the thread pool)
+# ==============================================================================
+def process_video(entry, idx, total, channel_info, channel_file):
+    vid_id = entry['id']
+    url = f"https://www.youtube.com/watch?v={vid_id}"
+    proxy_for_video = sticky_proxy_for(vid_id)
+
+    video_opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'skip_download': True,
+        'proxy': proxy_for_video,
+        'writesubtitles': False,
+        'extractor_args': {
+            'youtube': {
+                # Default yt-dlp queries several player clients per video
+                # (web/mweb/ios/android/tv...) to cover format/PO-token
+                # gaps. We only need metadata + a caption URL, so pin to
+                # one light client instead. 'android' has historically not
+                # needed a PO token for captions (unlike 'web', which
+                # increasingly does) but can occasionally return empty
+                # automatic_captions for a video that does have them --
+                # watch your "no transcript" rate after switching; fall
+                # back to player_client=['web'] if it climbs noticeably.
+                'player_client': ['android'],
+            }
+        },
+    }
+
+    t0 = time.monotonic()
+    try:
+        with yt_dlp.YoutubeDL(video_opts) as ydl_video:
+            info = ydl_video.extract_info(url, download=False)
+        t_extract = time.monotonic() - t0
+
+        views = info.get('view_count') or 0
+        if views < MIN_VIEWS:
+            log.info("Skipped (%d/%d): %s -- %d views", idx, total, vid_id, views)
+            return
+
+        t1 = time.monotonic()
+        raw_transcript = fetch_transcript_in_memory(info, proxy_for_video)
+        t_subs = time.monotonic() - t1
+
+        if not raw_transcript:
+            log.info("No transcript (%d/%d): %s [extract=%.1fs subs=%.1fs]",
+                      idx, total, vid_id, t_extract, t_subs)
+            return
+
+        record = {
+            "VideoID": vid_id,
+            "Channel": channel_info.get('channel') or channel_info.get('uploader', 'Unknown'),
+            "Title": info.get('title') or "",
+            "Duration": info.get('duration'),
+            "Views": views,
+            "RawTranscript": raw_transcript,  # punctuation restored in a separate pass below
+        }
+        append_to_jsonl(channel_file, record)
+        log.info("Saved (%d/%d): %s... [extract=%.1fs subs=%.1fs]",
+                  idx, total, record['Title'][:40], t_extract, t_subs)
+
+    except Exception as e:
+        log.error("Failed %s: %s", url, e)
+
+    time.sleep(random.uniform(0.4, 1.0))
+
+# ==============================================================================
+# PUNCTUATION PASS -- deliberately separate from the network loop
+# ==============================================================================
+def restore_punctuation_pass(channel_file):
+    """
+    Runs once, after scraping finishes for a channel. Kept out of the
+    per-video loop because model inference is CPU-bound and was previously
+    blocking on every single video while YouTube requests waited -- network
+    and CPU work never overlapped. Idempotent: only touches records that
+    still carry RawTranscript, so it's safe to re-run.
+    """
+    if not os.path.exists(channel_file):
+        return
+
+    with open(channel_file, 'r', encoding='utf-8') as f:
+        records = [json.loads(line) for line in f if line.strip()]
+
+    pending = [r for r in records if 'RawTranscript' in r and 'Transcript' not in r]
+    if not pending:
+        return
+
+    log.info("Restoring punctuation for %d transcripts in %s...", len(pending), channel_file)
+    t0 = time.monotonic()
+    for rec in pending:
+        raw = rec.pop('RawTranscript')
+        rec['Transcript'] = punct_model.restore_punctuation(raw) if raw.strip() else raw
+    elapsed = time.monotonic() - t0
+
+    tmp_path = channel_file + ".tmp"
+    with open(tmp_path, 'w', encoding='utf-8') as f:
+        for rec in records:
+            f.write(json.dumps(rec, ensure_ascii=False) + '\n')
+    os.replace(tmp_path, channel_file)
+
+    log.info("Punctuation restore done for %s (%d transcripts, %.1fs total, %.2fs/video).",
+              channel_file, len(pending), elapsed, elapsed / len(pending))
 
 # ==============================================================================
 # PIPELINE EXECUTION
 # ==============================================================================
 def process_channels(channels):
     os.makedirs(BASE_DIR, exist_ok=True)
-    
+
     ydl_opts_flat = {
         'extract_flat': True,
         'quiet': True,
@@ -184,11 +282,9 @@ def process_channels(channels):
 
     for channel_url in channels:
         log.info("Scanning channel: %s", channel_url)
-        
-        # Robust regex parsing for the channel handle
+
         match = re.search(r'(@[\w-]+)', channel_url)
         channel_handle = match.group(1) if match else "Unknown_Channel"
-            
         channel_file = os.path.join(BASE_DIR, f"{channel_handle}.jsonl")
         existing_ids = load_processed_ids(channel_file)
         log.info("Loaded %d previously processed videos for %s.", len(existing_ids), channel_handle)
@@ -205,62 +301,28 @@ def process_channels(channels):
             continue
 
         all_entries = [e for e in (channel_info.get('entries') or []) if e]
-        
-        # Pre-filter candidate videos (excluding view count check to avoid extract_flat bugs)
+
+        # Cheap pre-filter using the flat view_count when yt-dlp actually
+        # supplies one. Only entries with NO view_count (None) fall through
+        # to a full per-video check -- this avoids paying for the heavy,
+        # multi-request extract_info() call on videos that were never going
+        # to qualify anyway.
         candidate_entries = [
             e for e in all_entries
             if e.get('id') not in existing_ids
+            and (e.get('view_count') is None or e.get('view_count') >= MIN_VIEWS)
         ]
-        
         log.info("Found %d valid candidates to process.", len(candidate_entries))
 
-        for idx, entry in enumerate(candidate_entries, 1):
-            vid_id = entry['id']
-            url = f"https://www.youtube.com/watch?v={vid_id}"
-            proxy_for_video = sticky_proxy_for(vid_id)
-            
-            video_opts = {
-                'quiet': True,
-                'no_warnings': True,
-                'skip_download': True,
-                'proxy': proxy_for_video,
-                'writesubtitles': False,
-            }
-            
-            try:
-                with yt_dlp.YoutubeDL(video_opts) as ydl_video:
-                    info = ydl_video.extract_info(url, download=False)
-                    
-                # View count check moved here where metadata is fully loaded
-                views = info.get('view_count') or 0
-                if views < MIN_VIEWS:
-                    log.info("Skipped (%d/%d): %s has %d views (below threshold)", idx, len(candidate_entries), vid_id, views)
-                    continue
-                    
-                transcript = fetch_transcript_in_memory(info, proxy_for_video)
-                
-                if transcript:
-                    title = info.get('title') or ""
-                    record = {
-                        "VideoID": vid_id,
-                        "Channel": channel_info.get('channel') or channel_info.get('uploader', 'Unknown'),
-                        "Title": title,
-                        "Duration": info.get('duration'),
-                        "Views": views,
-                        "Transcript": transcript
-                    }
-                    
-                    append_to_jsonl(channel_file, record)
-                    existing_ids.add(vid_id)
-                    log.info("Saved (%d/%d): %s...", idx, len(candidate_entries), title[:45])
-                else:
-                    log.info("No transcript for: %s", url)
-                    
-            except Exception as e:
-                log.error("Failed %s: %s", url, e)
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS, thread_name_prefix="worker") as pool:
+            futures = [
+                pool.submit(process_video, entry, idx, len(candidate_entries), channel_info, channel_file)
+                for idx, entry in enumerate(candidate_entries, 1)
+            ]
+            for future in as_completed(futures):
+                future.result()  # re-raise anything unexpected instead of swallowing it silently
 
-            # Delay to avoid channel-level rate limits
-            time.sleep(random.uniform(1.2, 2.8))
+        restore_punctuation_pass(channel_file)
 
 if __name__ == "__main__":
     process_channels(CHANNELS)

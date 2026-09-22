@@ -2,3 +2,15 @@ slm_out/
 *.bin
 *.pt
 .DS_Store
+
+# data + artifacts, never committed
+data/
+*.jsonl
+__pycache__/
+*.pyc
+google-cloud-sdk/
+yt-ai-slm/
+
+# secrets
+*service-account*.json
+YT_AIproject-*.json

@@ -1,6 +1,14 @@
+# Stage 1 — scraping
+requests>=2.31.0
+yt-dlp>=2024.1.0
+deepmultilingualpunctuation>=1.0.1
+
+# Stage 2 — synthetic data pipeline
 google-genai>=0.3.0
 google-cloud-storage>=2.10.0
 sentence-transformers>=2.2.0
 scikit-learn>=1.3.0
 datasketch>=1.6.0
 numpy>=1.24.0
+
+# Stage 3 runs in Colab; torch is preinstalled there

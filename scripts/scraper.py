@@ -26,7 +26,7 @@ PROXY_PORT = 80
 PROXY_URL = f"http://{PROXY_USER}:{PROXY_PASS}@{PROXY_HOST}:{PROXY_PORT}"
 
 CHANNELS = [
-    "https://www.youtube.com/@Requestedreads/shorts",
+    "https://www.youtube.com/@TheRedditReader475/shorts",
 ]
 
 MIN_VIEWS = 50_000
@@ -36,6 +36,12 @@ MIN_VIEWS = 50_000
 # limit -- check your plan/dashboard before raising this. Start low, watch
 # the error rate in scraper.log for a while, then increase.
 MAX_WORKERS = 6
+
+# Caps how long any single yt-dlp network call can hang. Without this, a
+# stuck request can block its worker thread indefinitely -- which also means
+# Ctrl+C can't fully stop the script until that call times out or completes
+# on its own, since Python threads can't be killed from outside.
+SOCKET_TIMEOUT = 15
 
 ENGLISH_KEYS_PRIORITY = ("en", "en-orig", "en-US", "en-GB", "en-CA", "en-AU")
 
@@ -91,10 +97,40 @@ def append_to_jsonl(filepath, record):
 # ==============================================================================
 # PROXY HELPERS
 # ==============================================================================
-def sticky_proxy_for(video_id: str) -> str:
-    """Pins one video's metadata + subtitle request to the same exit IP."""
-    numeric_session = int(hashlib.md5(video_id.encode()).hexdigest()[:8], 16) % 1000000
+def sticky_proxy_for(video_id: str, attempt: int = 0) -> str:
+    """
+    Pins one video's metadata + subtitle request to the same exit IP.
+
+    `attempt` salts the session id. Without it this function is a pure
+    function of video_id alone, so a video that happens to draw a
+    YouTube-flagged IP once would draw that *same* IP forever -- including
+    on future runs, since a failed video never gets written to the JSONL
+    and so stays a "candidate" that gets retried with the identical doomed
+    session every time.
+    """
+    key = f"{video_id}:{attempt}" if attempt else video_id
+    numeric_session = int(hashlib.md5(key.encode()).hexdigest()[:8], 16) % 1000000
     return f"http://{PROXY_USER}-us-{numeric_session}:{PROXY_PASS}@{PROXY_HOST}:{PROXY_PORT}"
+
+
+def _is_retryable_extraction_error(err_text: str) -> bool:
+    """
+    Decide whether a fresh proxy session is likely to fix this error.
+    - "confirm your age" is an account/cookie gate on the video itself --
+      no exit IP will change that, so don't waste a retry on it.
+    - "not a bot" / "sign in to confirm" (without "age") is an IP-reputation
+      challenge -- a different exit IP plausibly clears it.
+    - Proxy/gateway errors (502s, tunnel failures) are Webshare-side hiccups,
+      also worth a retry.
+    """
+    text = err_text.lower()
+    if "confirm your age" in text:
+        return False
+    if "not a bot" in text or "sign in to confirm" in text:
+        return True
+    if "bad gateway" in text or "tunnel connection failed" in text or "proxyerror" in text:
+        return True
+    return False
 
 # ==============================================================================
 # EXTRACTION & CLEANING
@@ -168,36 +204,60 @@ def fetch_transcript_in_memory(info, proxy_url):
 def process_video(entry, idx, total, channel_info, channel_file):
     vid_id = entry['id']
     url = f"https://www.youtube.com/watch?v={vid_id}"
-    proxy_for_video = sticky_proxy_for(vid_id)
 
-    video_opts = {
-        'quiet': True,
-        'no_warnings': True,
-        'skip_download': True,
-        'proxy': proxy_for_video,
-        'writesubtitles': False,
-        'extractor_args': {
-            'youtube': {
-                # Default yt-dlp queries several player clients per video
-                # (web/mweb/ios/android/tv...) to cover format/PO-token
-                # gaps. We only need metadata + a caption URL, so pin to
-                # one light client instead. 'android' has historically not
-                # needed a PO token for captions (unlike 'web', which
-                # increasingly does) but can occasionally return empty
-                # automatic_captions for a video that does have them --
-                # watch your "no transcript" rate after switching; fall
-                # back to player_client=['web'] if it climbs noticeably.
-                'player_client': ['android'],
-            }
-        },
-    }
+    MAX_ATTEMPTS = 3
+    info = None
+    proxy_for_video = None
+    t_extract = 0.0
 
-    t0 = time.monotonic()
+    for attempt in range(MAX_ATTEMPTS):
+        proxy_for_video = sticky_proxy_for(vid_id, attempt)
+        video_opts = {
+            'quiet': True,
+            'no_warnings': True,
+            'skip_download': True,
+            'proxy': proxy_for_video,
+            'writesubtitles': False,
+            'socket_timeout': SOCKET_TIMEOUT,  # bounds how long a stuck request can block a worker
+            'extractor_args': {
+                'youtube': {
+                    # Default yt-dlp queries several player clients per video
+                    # (web/mweb/ios/android/tv...) to cover format/PO-token
+                    # gaps. We only need metadata + a caption URL, so pin to
+                    # one light client instead. 'android' has historically not
+                    # needed a PO token for captions (unlike 'web', which
+                    # increasingly does) but can occasionally return empty
+                    # automatic_captions for a video that does have them --
+                    # watch your "no transcript" rate; fall back to
+                    # player_client=['web'] if it climbs noticeably.
+                    'player_client': ['android'],
+                }
+            },
+        }
+
+        t0 = time.monotonic()
+        try:
+            with yt_dlp.YoutubeDL(video_opts) as ydl_video:
+                info = ydl_video.extract_info(url, download=False)
+            t_extract = time.monotonic() - t0
+            break  # success, stop retrying
+
+        except Exception as e:
+            t_extract = time.monotonic() - t0
+            err_text = str(e)
+            if attempt < MAX_ATTEMPTS - 1 and _is_retryable_extraction_error(err_text):
+                log.warning("Retry %d/%d (%d/%d) %s: %s", attempt + 2, MAX_ATTEMPTS, idx, total,
+                            vid_id, err_text.splitlines()[0][:120])
+                time.sleep(random.uniform(1.0, 2.5))
+                continue
+            log.error("Failed %s: %s", url, err_text.splitlines()[0][:200])
+            time.sleep(random.uniform(0.4, 1.0))
+            return
+
+    if info is None:
+        return
+
     try:
-        with yt_dlp.YoutubeDL(video_opts) as ydl_video:
-            info = ydl_video.extract_info(url, download=False)
-        t_extract = time.monotonic() - t0
-
         views = info.get('view_count') or 0
         if views < MIN_VIEWS:
             log.info("Skipped (%d/%d): %s -- %d views", idx, total, vid_id, views)
@@ -278,6 +338,7 @@ def process_channels(channels):
         'no_warnings': True,
         'ignoreerrors': True,
         'proxy': PROXY_URL,
+        'socket_timeout': SOCKET_TIMEOUT,
     }
 
     for channel_url in channels:
@@ -314,13 +375,27 @@ def process_channels(channels):
         ]
         log.info("Found %d valid candidates to process.", len(candidate_entries))
 
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS, thread_name_prefix="worker") as pool:
-            futures = [
-                pool.submit(process_video, entry, idx, len(candidate_entries), channel_info, channel_file)
-                for idx, entry in enumerate(candidate_entries, 1)
-            ]
+        pool = ThreadPoolExecutor(max_workers=MAX_WORKERS, thread_name_prefix="worker")
+        futures = [
+            pool.submit(process_video, entry, idx, len(candidate_entries), channel_info, channel_file)
+            for idx, entry in enumerate(candidate_entries, 1)
+        ]
+        try:
             for future in as_completed(futures):
                 future.result()  # re-raise anything unexpected instead of swallowing it silently
+            pool.shutdown(wait=True)
+        except KeyboardInterrupt:
+            # All candidates are submitted up front, so at this point most
+            # of them are still queued, not running -- only MAX_WORKERS are
+            # actually in flight. cancel_futures=True drops everything still
+            # queued instead of running the whole remaining backlog, so
+            # shutdown only has to wait on the handful of in-flight requests
+            # (bounded by SOCKET_TIMEOUT), not the other ~1000 videos.
+            log.warning("Interrupted -- cancelling queued videos, waiting up to ~%ds "
+                        "for in-flight requests to finish...", SOCKET_TIMEOUT)
+            pool.shutdown(wait=True, cancel_futures=True)
+            log.warning("Stopped. Progress already saved to %s is intact; rerun to resume.", channel_file)
+            raise
 
         restore_punctuation_pass(channel_file)
 

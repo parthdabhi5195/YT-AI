@@ -9,9 +9,15 @@ instead of silently ending up in training data.
 
 No third-party dependencies -- importable anywhere in the pipeline.
 """
-import re
+import re # regular expressions 
+import sys
+from pathlib import Path
 
-from prompts import REQUIRED_TEMPLATE_FIELDS, BEAT_KEYS
+# Self-contained path setup, so this module (and prompts.py through it)
+# can be imported and unit-tested directly, not only as a side effect of
+# a stage script having already appended scripts/ to sys.path.
+sys.path.append(str(Path(__file__).parent))
+from prompts import REQUIRED_TEMPLATE_FIELDS, BEAT_KEYS  # noqa: E402
 
 
 def validate_template(template) -> list:
@@ -29,9 +35,9 @@ def validate_template(template) -> list:
             problems.append(f"missing field: {field}")
 
     roles = template.get("character_roles")
-    if roles is not None and not isinstance(roles, list):
+    if roles is not None and not isinstance(roles, list): # character_roles is optional, but if present it must be a list
         problems.append("character_roles is not a list")
-    elif isinstance(roles, list) and len(roles) == 0:
+    elif isinstance(roles, list) and len(roles) == 0: # if character_roles is present and is a list, it must not be empty
         problems.append("character_roles is empty")
 
     uses_names = template.get("uses_character_names")
@@ -45,12 +51,12 @@ def validate_template(template) -> list:
         else:
             for key in BEAT_KEYS:
                 if key not in beats:
-                    problems.append(f"beats missing key: {key}")
+                    problems.append(f"beats missing key: {key}") # There are missing keys
             extra = set(beats.keys()) - set(BEAT_KEYS)
             if extra:
-                problems.append(f"beats has unexpected keys: {sorted(extra)}")
+                problems.append(f"beats has unexpected keys: {sorted(extra)}") # There are extra keys
             filled = [k for k in BEAT_KEYS if str(beats.get(k, "")).strip()]
-            if len(filled) < 3:
+            if len(filled) < 3: # If less than 3 beats have content, then the extraction is likely too weak to be useful
                 problems.append(
                     f"only {len(filled)} beats have content -- extraction "
                     f"likely failed"
@@ -65,11 +71,17 @@ def validate_template(template) -> list:
     return problems
 
 
-# Signs the model returned something other than clean story prose.
+# Regex list of common signs the model returned something other than clean story prose.
 _MARKDOWN_PATTERNS = [
     (re.compile(r"^\s*#{1,6}\s"), "starts with a markdown heading"),
     (re.compile(r"^\s*```"), "contains a code fence"),
     (re.compile(r"\*\*[^*]+\*\*"), "contains bold markdown"),
+    # Single-asterisk italics around a word or phrase: *real*, *never said*.
+    # The lookarounds require both asterisks to sit OUTSIDE a word, so
+    # censored profanity (f***ing, sh**) is not mistaken for markdown, and
+    # the doubled asterisks of **bold** are left to the pattern above.
+    (re.compile(r"(?<![*\w])\*(?=[^\s*])[^*\n]{1,60}?(?<=[^\s*])\*(?![*\w])"),
+     "contains italic markdown"),
     (re.compile(r"^\s*(Title|TITLE)\s*:", re.MULTILINE), "contains a Title: line"),
     (re.compile(r"^\s*(Story|STORY)\s*:", re.MULTILINE), "contains a Story: label"),
 ]
@@ -78,7 +90,7 @@ _MARKDOWN_PATTERNS = [
 def validate_story(
     text,
     min_words: int = 200,
-    max_words: int = 350,
+    max_words: int = 340,
     forbidden_names=None,
 ) -> list:
     """
@@ -95,26 +107,25 @@ def validate_story(
     if not isinstance(text, str):
         return ["text is not a string"]
 
-    stripped = text.strip()
+    stripped = text.strip() # strip whitespace
     if not stripped:
         return ["text is empty"]
 
-    word_count = len(stripped.split())
-    if word_count < min_words:
-        problems.append(f"too short: {word_count} words (min {min_words})")
-    elif word_count > max_words:
-        problems.append(f"too long: {word_count} words (max {max_words})")
+    wc = word_count(stripped) # word count to see if within range.
+    if wc < min_words:
+        problems.append(f"too short: {wc} words (min {min_words})")
+    elif wc > max_words:
+        problems.append(f"too long: {wc} words (max {max_words})")
 
     for pattern, description in _MARKDOWN_PATTERNS:
         if pattern.search(stripped):
             problems.append(description)
 
-    # A story wrapped entirely in quotes usually means the model treated
-    # the whole thing as a quoted block.
+    # A story wrapped entirely in quotes usually means the model treated the whole thing as a quoted block.
     if stripped.startswith('"') and stripped.endswith('"') and stripped.count('"') == 2:
         problems.append("entire story is wrapped in quotation marks")
 
-    if forbidden_names:
+    if forbidden_names: # Check if names are being copied from the source story.
         lowered = stripped.lower()
         hits = [n for n in forbidden_names
                 if n and re.search(rf"\b{re.escape(n.lower())}\b", lowered)]

@@ -1,10 +1,15 @@
 """
 Stage 1 -- Structural extraction.
 
-Reads your proven source scripts and asks Gemini to output ONLY an
-abstract structural template for each one (trope, character roles, plot
-beats, emotional arc, hook style, narrative voice) -- with no character
-names, settings, or verbatim phrases from the source.
+Reads your proven source scripts and asks Gemini to output ONLY an abstract structural template for each one: 
+            trope, 
+            character roles, 
+            plot
+            beats, 
+            emotional arc, 
+            hook style, 
+            narrative voice 
+-- with no character names, settings, or verbatim phrases from the source.
 
 Usage:
     python scripts/extract_templates.py \
@@ -12,6 +17,15 @@ Usage:
         --output data/templates/templates.jsonl \
         --project YOUR_PROJECT_ID \
         --limit 50    # start small; omit --limit to run all of them
+
+Structure:
+    source_scripts.jsonl
+            |
+            v
+    extract_templates.py
+            |
+            v
+    templates.jsonl
 
 Each line of the input JSONL must have "id" and "text". Extra fields
 (title, channel, views) are carried through to the output.
@@ -29,141 +43,69 @@ first place, so this should be rare.
 past already-done IDs and failed extractions until it has written N new
 templates, which is what you want for a test run.
 """
-import argparse
-import json
-import sys
-import time
-from pathlib import Path
+import argparse # handles command-line arguments
+import json # parses JSON data
+import sys # importing local directory
+from pathlib import Path # handles output paths
 
 sys.path.append(str(Path(__file__).parent))
-from prompts import build_extraction_prompt  # noqa: E402
+
+# importing Gemini-related helpers.
+from gemini_io import (  # noqa: E402
+    FatalConfigError, # detects fatal errors in API calls
+    call_with_retry, # handles retry logic
+    generate_text, # handles Gemini API calls and response parsing
+)
+
+from pipeline_io import (  # noqa: E402
+    append_row, # write to file and flush to disk immediately
+    carry_metadata, # copy over source metadata fields to the output row
+    ensure_trailing_newline,  # edge case logic for resuming runs
+    iter_jsonl, # iterates through JSONL files line by line
+    load_ids, # loads IDs from output file to skip already processed rows (resume logic)
+    print_stats, # summary blocks
+)
+from prompts import TEMPLATE_JSON_SCHEMA, build_extraction_prompt  # noqa: E402
 from validation import validate_template  # noqa: E402
 
 from google import genai
 
-
-# Substrings that indicate a problem no amount of retrying will fix --
-# bad credentials, wrong project, model name that doesn't exist. Without
-# this, a misconfigured run burns 3 retries x 6,500 rows before you find
-# out anything is wrong.
-FATAL_ERROR_MARKERS = (
-    "permission_denied", "permission denied", "unauthenticated",
-    "invalid_argument", "not_found", "was not found",
-    "api key not valid", "could not automatically determine credentials",
-    "billing", "has not been used in project", "is disabled",
-)
-
-
-class FatalExtractionError(RuntimeError):
-    """Configuration-level failure -- stop the whole run, don't retry."""
+# Makes the model return raw JSON in the template's shape, instead of
+# asking for it in the prompt and cleaning up afterward -- so there are no
+# markdown fences to strip and no malformed JSON to parse around.
+#
+# This covers STRUCTURE only. validate_template still runs on the parsed
+# result for the things the schema can't state: that enough beats actually
+# have content, and that the string fields aren't blank.
+EXTRACTION_CONFIG = {
+    "response_mime_type": "application/json",
+    "response_json_schema": TEMPLATE_JSON_SCHEMA,
+}
 
 
-def _is_fatal(exc: Exception) -> bool:
-    msg = f"{type(exc).__name__}: {exc}".lower()
-    return any(marker in msg for marker in FATAL_ERROR_MARKERS)
-
-
-def _strip_code_fences(text: str) -> str:
-    """Models sometimes wrap JSON in ``` fences despite being told not to."""
-    text = text.strip()
-    if not text.startswith("```"):
-        return text
-    lines = text.split("\n")
-    if lines[0].startswith("```"):
-        lines = lines[1:]
-    if lines and lines[-1].strip().startswith("```"):
-        lines = lines[:-1]
-    return "\n".join(lines).strip()
-
-
-def extract_one(client, model: str, story_text: str, retries: int = 3) -> dict:
+def extract_one(client, model, story_text, retries=3, failures=None):
     """
-    Returns a validated template dict, or raises.
+    Returns a validated template dict, or raises exception.
 
-    Catches broadly on purpose. Beyond google.genai.errors.APIError, real
-    runs hit: AttributeError/TypeError when resp.text is missing or None
-    (blocked/empty response), json.JSONDecodeError (a ValueError
-    subclass) on malformed JSON, google.auth errors when credentials
-    expire mid-run, and assorted httpx/socket errors on network blips.
-    Enumerating those exactly across SDK versions is fragile, so the loop
-    retries anything transient and fails fast on anything fatal.
+    failures: optional list. Every attempt that parsed as JSON but failed
+    validation is appended to it as {"template": ..., "problems": [...]},
+    so the caller can keep the rejected output for diagnosis instead of
+    only learning that three attempts failed.
     """
     prompt = build_extraction_prompt(story_text)
-    last_err = None
 
-    for attempt in range(retries):
-        try:
-            resp = client.models.generate_content(model=model, contents=prompt)
+    def attempt():
+        template = json.loads(
+            generate_text(client, model, prompt, EXTRACTION_CONFIG)
+        )
+        problems = validate_template(template)
+        if problems: # if list is not empty
+            if failures is not None:
+                failures.append({"template": template, "problems": problems})
+            raise ValueError(f"schema validation failed: {problems}")
+        return template
 
-            # resp.text can be absent or None when a response is blocked
-            # or empty. Don't let that raise an unhandled AttributeError.
-            text = getattr(resp, "text", None)
-            if not text or not text.strip():
-                raise ValueError("empty or missing response text")
-
-            template = json.loads(_strip_code_fences(text))
-
-            problems = validate_template(template)
-            if problems:
-                raise ValueError(f"schema validation failed: {problems}")
-
-            return template
-
-        except Exception as e:  # noqa: BLE001 -- see docstring
-            if _is_fatal(e):
-                raise FatalExtractionError(
-                    f"Configuration error, stopping run: {type(e).__name__}: {e}"
-                ) from e
-            last_err = e
-            if attempt < retries - 1:
-                time.sleep(2 ** attempt)  # 1s, 2s
-
-    raise RuntimeError(
-        f"failed after {retries} attempts: {type(last_err).__name__}: {last_err}"
-    )
-
-
-def ensure_trailing_newline(path: Path) -> None:
-    """
-    If a previous run was killed mid-write, the file can end without a
-    newline. Appending then concatenates the new row onto the partial one,
-    corrupting BOTH -- the partial line AND the row being written, which
-    silently disappears. Repair the boundary before appending.
-    """
-    if not path.exists() or path.stat().st_size == 0:
-        return
-    with open(path, "rb") as f:
-        f.seek(-1, 2)
-        if f.read(1) != b"\n":
-            with open(path, "a", encoding="utf-8") as fa:
-                fa.write("\n")
-            print("  note: repaired a missing newline at the end of the "
-                  "output file (previous run was interrupted mid-write)")
-
-
-def load_done_ids(out_path: Path) -> set:
-    """
-    Read IDs already extracted. Tolerates a truncated final line, which
-    happens if a previous run was killed mid-write -- that shouldn't
-    block resuming.
-    """
-    done = set()
-    if not out_path.exists():
-        return done
-    with open(out_path, "r", encoding="utf-8") as f:
-        for line_no, line in enumerate(f, 1):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                row = json.loads(line)
-            except json.JSONDecodeError:
-                print(f"  warning: output line {line_no} is not valid JSON "
-                      f"(likely a truncated final line) -- ignoring it")
-                continue
-            if isinstance(row, dict) and "id" in row:
-                done.add(row["id"])
-    return done
+    return call_with_retry(attempt, retries=retries)
 
 
 def main():
@@ -175,84 +117,98 @@ def main():
     parser.add_argument("--model", default="gemini-2.5-flash-lite")
     parser.add_argument("--limit", type=int, default=None,
                         help="Stop after N successful NEW templates")
+    parser.add_argument("--keep-invalid", action="store_true",
+                        help="Also write templates that failed validation, with "
+                             "a 'problems' field, to <output>.invalid.jsonl. They "
+                             "go to a SEPARATE file on purpose -- a bad template "
+                             "would otherwise seed hundreds of bad stories "
+                             "downstream. Useful for diagnosing extraction.")
     args = parser.parse_args()
 
     client = genai.Client(vertexai=True, project=args.project, location=args.location)
 
-    in_path = Path(args.input)
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    invalid_path = out_path.with_suffix(out_path.suffix + ".invalid.jsonl")
 
     ensure_trailing_newline(out_path)
-    resumed_ids = load_done_ids(out_path)
-    seen_ids = set(resumed_ids)  # grows as this run writes new rows
-    if resumed_ids:
-        print(f"Resuming -- {len(resumed_ids)} templates already extracted.")
+    done_ids = load_ids(out_path)       # from previous runs; never mutated
+    written_ids = set()                 # written by THIS run
+    if done_ids:
+        print(f"Resuming -- {len(done_ids)} templates already extracted.")
 
     stats = {"read": 0, "skipped_done": 0, "skipped_dupe_input": 0,
-             "bad_input_line": 0, "failed": 0, "written": 0}
+             "bad_input_line": 0, "failed": 0, "invalid_kept": 0, "written": 0}
 
-    with open(in_path, "r", encoding="utf-8") as f_in, \
-         open(out_path, "a", encoding="utf-8") as f_out:
-        for line_no, line in enumerate(f_in, 1):
+    def bad_line(line_no, line, exc):
+        print(f"SKIPPED input line {line_no}: malformed ({exc})")
+        stats["bad_input_line"] += 1
+
+    f_invalid = open(invalid_path, "a", encoding="utf-8") if args.keep_invalid else None
+
+    with open(out_path, "a", encoding="utf-8") as f_out: # append mode to preserve previous outputs
+        for line_no, row in iter_jsonl(args.input, on_bad=bad_line):
             if args.limit and stats["written"] >= args.limit:
                 break
-
-            line = line.strip()
-            if not line:
-                continue
             stats["read"] += 1
 
             try:
-                row = json.loads(line)
                 row_id = row["id"]
                 story_text = row["text"]
-            except (json.JSONDecodeError, KeyError, TypeError) as e:
+            except (KeyError, TypeError) as e:
                 print(f"SKIPPED input line {line_no}: malformed ({e})")
                 stats["bad_input_line"] += 1
                 continue
 
-            if row_id in seen_ids:
-                # Distinguish "already done in a previous run" from "this
-                # ID appears twice in the input file" -- both are skipped,
-                # but a within-run duplicate means your source data has a
-                # problem worth knowing about.
-                if row_id in resumed_ids:
-                    stats["skipped_done"] += 1
-                else:
-                    stats["skipped_dupe_input"] += 1
-                    print(f"  warning: input line {line_no} repeats id "
-                          f"{row_id!r} -- skipping the duplicate")
+            # A repeat within this run means the source data has a problem
+            # worth knowing about; an ID from a previous run is just done.
+            if row_id in written_ids:
+                stats["skipped_dupe_input"] += 1
+                print(f"  warning: input line {line_no} repeats id "
+                      f"{row_id!r} -- skipping the duplicate")
+                continue
+            if row_id in done_ids:
+                stats["skipped_done"] += 1
                 continue
 
+            failures = [] if args.keep_invalid else None
             try:
-                template = extract_one(client, args.model, story_text)
-            except FatalExtractionError as e:
+                template = extract_one(client, args.model, story_text,
+                                       failures=failures)
+            except FatalConfigError as e:
                 print(f"\nFATAL: {e}")
                 print("Fix the configuration and re-run -- progress so far is saved.")
                 break
             except RuntimeError as e:
                 print(f"SKIPPED {row_id}: {e}")
                 stats["failed"] += 1
+                # The row is NOT added to written_ids, so a later re-run
+                # retries it. This file is diagnostic only.
+                if f_invalid is not None and failures:
+                    last = failures[-1]
+                    append_row(f_invalid, carry_metadata(row, {
+                        "id": row_id,
+                        "template": last["template"],
+                        "problems": last["problems"],
+                        "attempts": len(failures),
+                    }))
+                    stats["invalid_kept"] += 1
                 continue
 
-            out_row = {"id": row_id, "template": template}
-            for extra_key in ("title", "channel", "views"):
-                if extra_key in row:
-                    out_row[extra_key] = row[extra_key]
-
-            f_out.write(json.dumps(out_row) + "\n")
-            f_out.flush()
-            seen_ids.add(row_id)  # prevents reprocessing a duplicate input ID
+            append_row(f_out, carry_metadata(row, {"id": row_id, "template": template}))
+            written_ids.add(row_id)
             stats["written"] += 1
 
             if stats["written"] % 25 == 0:
                 print(f"Extracted {stats['written']} templates...")
 
-    print("\n--- Extraction summary ---")
-    for k, v in stats.items():
-        print(f"{k:>19}: {v}")
+    if f_invalid is not None:
+        f_invalid.close()
+
+    print_stats("Extraction summary", stats)
     print(f"\nOutput: {out_path}")
+    if args.keep_invalid and stats["invalid_kept"]:
+        print(f"Rejected templates: {invalid_path}")
 
 
 if __name__ == "__main__":

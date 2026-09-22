@@ -46,18 +46,34 @@ class DiversitySampler:
             self._cycles[key] = self._new_cycle(key)
             return next(self._cycles[key])
 
-    def sample_combo(self) -> dict:
-        name_a = self._draw("names")
-        name_b = self._draw("names")
-        while name_b == name_a:
-            name_b = self._draw("names")
+    def sample_combo(self, num_names: int = 2) -> dict:
+        """
+        num_names: how many DISTINCT character names to draw. Generation
+        callers pass one per role in the template (see prompts.names_needed)
+        so the model is handed a name for every character. Left to invent
+        supporting names itself, it collapses onto the same few defaults --
+        in a 100-story pilot, Sarah appeared in 22% of stories and Mark 21%.
+
+        With the default of 2 this draws exactly the same stream as before,
+        so seeds stay reproducible for existing callers.
+        """
+        num_names = min(max(2, num_names), len(self.pools["names"]))
+        names = []
+        # A repeat is only possible at a cycle boundary, when the reshuffled
+        # pool starts with a name drawn at the end of the previous cycle.
+        # Skipping it and drawing again always terminates: a fresh cycle
+        # holds every name exactly once.
+        while len(names) < num_names:
+            name = self._draw("names")
+            if name not in names:
+                names.append(name)
         return {
             "setting": self._draw("settings"),
             "occupation": self._draw("occupations"),
             "relationship_dynamic": self._draw("relationship_dynamics"),
             "incident_seed": self._draw("incident_seeds"),
             "hook_style": self._draw("hook_styles"),
-            "character_names": [name_a, name_b],
+            "character_names": names,
         }
 
 

@@ -8,22 +8,24 @@ Files are concatenated in EXACTLY the order you list them.
 
 Usage:
     python scripts/prepare_source_data.py \
-        --inputs data/source_scripts/_Broken.jsonl \
-                 data/source_scripts/_Requestedreads.jsonl \
-                 data/source_scripts/_TaleReader_0.jsonl \
+        --inputs data/source_scripts/@Broken.jsonl \
+                 data/source_scripts/@Requestedreads.jsonl \
+                 data/source_scripts/@TaleReader_0.jsonl \
         --output data/source_scripts/source_scripts.jsonl
 
-NOTE ON DUPLICATE IDs: YouTube video IDs are 11-character globally
-unique identifiers -- one per video, and a video belongs to exactly one
-channel -- so per-channel exports cannot legitimately collide. Verified
-empirically against your 6,473 rows: zero duplicates. Nothing is skipped
-or dropped here as a result. A passive count check at the end warns if
-duplicates ever do appear, which in practice would only mean the scraper
-ran twice and appended; delete those three lines if you don't want it.
+NOTE ON Duration: required of every input row as an exporter-contract
+check, but deliberately not carried into the output -- no later stage
+uses it. Add it to the written row below if you ever want to filter or
+weight by video length.
+
+Duplicate VideoIDs are not checked for as YouTube guarentees global uniqueness.
 """
 import argparse
-import json
+import sys
 from pathlib import Path
+
+sys.path.append(str(Path(__file__).parent))
+from pipeline_io import append_row, iter_jsonl, print_stats  # noqa: E402
 
 REQUIRED_FIELDS = {"VideoID", "Channel", "Title", "Duration", "Views", "Transcript"}
 
@@ -42,50 +44,40 @@ def main():
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    stats = {"total_seen": 0, "missing_fields": 0, "bad_json": 0, "kept": 0}
-    ids = []
-
+    stats = {
+            "total_seen": 0, 
+             "missing_fields": 0, 
+             "bad_json": 0, 
+             "kept": 0
+            }
     with open(out_path, "w", encoding="utf-8") as f_out:
         for file_path in args.inputs:
-            with open(file_path, "r", encoding="utf-8") as f_in:
-                for line_no, line in enumerate(f_in, 1):
-                    line = line.strip()
-                    if not line:
-                        continue
-                    stats["total_seen"] += 1
 
-                    try:
-                        row = json.loads(line)
-                    except json.JSONDecodeError as e:
-                        print(f"  SKIPPED {file_path}:{line_no} -- bad JSON ({e})")
-                        stats["bad_json"] += 1
-                        continue
+            def bad_line(line_no, line, exc, _path=file_path):
+                print(f"  SKIPPED {_path}:{line_no} -- bad JSON ({exc})")
+                stats["bad_json"] += 1
 
-                    if not REQUIRED_FIELDS.issubset(row.keys()):
-                        missing = sorted(REQUIRED_FIELDS - set(row.keys()))
-                        print(f"  SKIPPED {file_path}:{line_no} -- missing {missing}")
-                        stats["missing_fields"] += 1
-                        continue
+            for line_no, row in iter_jsonl(file_path, on_bad=bad_line): # Iterate through each (#, JSON) in input file.
+                stats["total_seen"] += 1
 
-                    ids.append(row["VideoID"])
-                    f_out.write(json.dumps({
-                        "id": row["VideoID"],
-                        "text": row["Transcript"],
-                        "title": row["Title"],
-                        "channel": row["Channel"],
-                        "views": row["Views"],
-                    }) + "\n")
-                    stats["kept"] += 1
+                if not REQUIRED_FIELDS.issubset(row.keys()): # Print warning and skip if required fields are missing in JSON
+                    missing = sorted(REQUIRED_FIELDS - set(row.keys()))
+                    print(f"  SKIPPED {file_path}:{line_no} -- missing {missing}")
+                    stats["missing_fields"] += 1
+                    continue
 
-    print("\n--- Conversion summary ---")
-    for k, v in stats.items():
-        print(f"{k:>16}: {v}")
+                append_row(f_out, { # What the final output row looks like for source_scripts.jsonl
+                    "id": row["VideoID"],
+                    "text": row["Transcript"],
+                    "title": row["Title"],
+                    "channel": row["Channel"],
+                    "views": row["Views"],
+                }) # writing to hard disk immendiately instead of storing buffer data in RAM.
+                stats["kept"] += 1
 
-    if len(ids) != len(set(ids)):
-        print(f"\nWARNING: {len(ids) - len(set(ids))} duplicate VideoID(s) found. "
-              f"YouTube IDs are globally unique, so this almost certainly means "
-              f"the same file was passed twice or the scraper appended a re-run. "
-              f"Nothing was dropped -- check your --inputs list.")
+            
+
+    print_stats("Conversion summary", stats)
 
     print(f"\nWrote {stats['kept']} stories to {out_path}")
 

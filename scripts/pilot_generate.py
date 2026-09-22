@@ -23,89 +23,56 @@ same order). It does not make Gemini's text output reproducible --
 byte-identical across runs.
 """
 import argparse
-import json
 import sys
-import time
 from pathlib import Path
 
 sys.path.append(str(Path(__file__).parent))
 from diversity_sampler import DiversitySampler  # noqa: E402
-from prompts import build_prompt  # noqa: E402
-from validation import validate_story, word_count  # noqa: E402
-from extract_templates import (  # noqa: E402
-    FatalExtractionError, _is_fatal, ensure_trailing_newline,
+from gemini_io import FatalConfigError, call_with_retry, generate_text  # noqa: E402
+from pipeline_io import (  # noqa: E402
+    append_row, # write to file and flush to disk immediately
+    carry_metadata, # copy over source metadata fields to the output row
+    ensure_trailing_newline, # edge case logic for resuming runs
+    iter_jsonl, # iterates through JSONL files line by line
+    load_ids, # loads IDs from output file to skip already processed rows (resume logic)
+    print_stats, # summary blocks
 )
+from prompts import build_prompt, names_needed  # noqa: E402
+from validation import validate_story, word_count  # noqa: E402
 
 from google import genai
 
-
-def generate_one(client, model, prompt, temperature=1.0, retries=3):
-    """
-    Same broad-catch rationale as extract_one: beyond APIError, real runs
-    hit missing/None resp.text on blocked responses, auth expiry, and
-    network blips. Fatal config errors fail fast instead of burning
-    retries on every row.
-    """
-    last_err = None
-    for attempt in range(retries):
-        try:
-            resp = client.models.generate_content(
-                model=model,
-                contents=prompt,
-                config={"temperature": temperature},
-            )
-            text = getattr(resp, "text", None)
-            if not text or not text.strip():
-                raise ValueError("empty or missing response text")
-            return text.strip()
-        except Exception as e:  # noqa: BLE001
-            if _is_fatal(e):
-                raise FatalExtractionError(
-                    f"Configuration error, stopping run: {type(e).__name__}: {e}"
-                ) from e
-            last_err = e
-            if attempt < retries - 1:
-                time.sleep(2 ** attempt)
-    raise RuntimeError(
-        f"failed after {retries} attempts: {type(last_err).__name__}: {last_err}"
+# Generating 1 story per prrompt with retry logic.
+def generate_one(client, model, prompt, temperature=1.0, max_output_tokens=500, retries=3):
+    return call_with_retry(
+        lambda: generate_text(client, model, prompt, {
+            "temperature": temperature,
+            "max_output_tokens": max_output_tokens
+            }),
+        retries=retries,
     )
-
-
-def load_done_story_ids(out_path: Path) -> set:
-    done = set()
-    if not out_path.exists():
-        return done
-    with open(out_path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                row = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(row, dict) and "id" in row:
-                done.add(row["id"])
-    return done
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--templates", required=True)
-    parser.add_argument("--output", required=True)
-    parser.add_argument("--project", required=True)
-    parser.add_argument("--location", default="us-central1")
+    parser.add_argument("--templates", required=True) # template file path
+    parser.add_argument("--output", required=True) # pilot output file path
+    parser.add_argument("--project", required=True) # GCP project ID
+    parser.add_argument("--location", default="us-central1") # GCP location for Gemini API to ensure batch request pricing rates
     parser.add_argument("--model", default="gemini-2.5-flash-lite")
     parser.add_argument("--variants-per-template", type=int, default=15)
     parser.add_argument("--max-templates", type=int, default=100)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument("--seed", type=int, default=42) # deterministic sampling of diversity combos. Useful for checking diversity
+    parser.add_argument("--temperature", type=float, default=1.0) # generation temperature for Gemini API. 0 is deterministic, 1 is default, >1 is more random
     parser.add_argument("--min-words", type=int, default=200)
-    parser.add_argument("--max-words", type=int, default=350)
+    parser.add_argument("--max-words", type=int, default=340)
     parser.add_argument("--keep-invalid", action="store_true",
                         help="Write stories that fail validation too, flagged "
                              "with a 'problems' field, instead of dropping "
                              "them. Useful for diagnosing a bad prompt.")
+    parser.add_argument("--max-output-tokens", type=int, default=500,
+                        help="Must match build_batch_requests.py's default so "
+                         "the pilot can reproduce the batch path's truncation.")
     args = parser.parse_args()
 
     client = genai.Client(vertexai=True, project=args.project, location=args.location)
@@ -114,29 +81,34 @@ def main():
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     ensure_trailing_newline(out_path)
-    done_ids = load_done_story_ids(out_path)
+    done_ids = load_ids(out_path)
     if done_ids:
         print(f"Resuming -- {len(done_ids)} stories already generated.")
 
-    stats = {"bad_template_line": 0, "skipped_done": 0, "api_failed": 0,
-             "invalid_dropped": 0, "invalid_kept": 0, "written": 0}
+    stats = {
+        "bad_template_line": 0, 
+        "skipped_done": 0, 
+        "api_failed": 0,
+        "invalid_dropped": 0, 
+        "invalid_kept": 0, 
+        "written": 0
+    }
 
-    with open(args.templates, "r", encoding="utf-8") as f_templates, \
-         open(out_path, "a", encoding="utf-8") as f_out:
+    def bad_line(line_no, line, exc):
+        print(f"SKIPPED template line {line_no}: malformed ({exc})")
+        stats["bad_template_line"] += 1
 
+    with open(out_path, "a", encoding="utf-8") as f_out: # append mode to resume runs and not overwrite existing output
         t_idx = 0
-        for line_no, line in enumerate(f_templates, 1):
+        for line_no, row in iter_jsonl(args.templates, on_bad=bad_line):
             if t_idx >= args.max_templates:
                 break
-            line = line.strip()
-            if not line:
-                continue
 
             try:
-                row = json.loads(line)
+                # extract template and template_id from the source template row
                 template = row["template"]
                 template_id = row["id"]
-            except (json.JSONDecodeError, KeyError, TypeError) as e:
+            except (KeyError, TypeError) as e:
                 print(f"SKIPPED template line {line_no}: malformed ({e})")
                 stats["bad_template_line"] += 1
                 continue
@@ -144,38 +116,45 @@ def main():
             t_idx += 1
 
             for v in range(args.variants_per_template):
-                story_id = f"{template_id}_v{v}"
-                if story_id in done_ids:
+                story_id = f"{template_id}_v{v}" # for each variant, it builds a unique story_id by appending the variant number to the template_id
+                if story_id in done_ids: # Preventing a duplicate output from a rerun
                     stats["skipped_done"] += 1
                     continue
 
-                combo = sampler.sample_combo()
+                # generate a new diversity combo for the current template variant    
+                combo = sampler.sample_combo(names_needed(template))
                 prompt = build_prompt(template, combo)
 
                 try:
                     story_text = generate_one(
-                        client, args.model, prompt, temperature=args.temperature
+                        client, 
+                        args.model, 
+                        prompt, 
+                        temperature=args.temperature, 
+                        max_output_tokens=args.max_output_tokens,
                     )
-                except FatalExtractionError as e:
+                except FatalConfigError as e: # stops whole run
                     print(f"\nFATAL: {e}")
                     print("Progress so far is saved.")
+                    print_stats("Pilot summary", stats)
                     return
-                except RuntimeError as e:
+                except RuntimeError as e: # continues running
                     print(f"SKIPPED {story_id}: {e}")
                     stats["api_failed"] += 1
                     continue
 
+                # validate after recieving story from Gemini API    
                 problems = validate_story(
                     story_text,
                     min_words=args.min_words,
                     max_words=args.max_words,
                 )
-                if problems and not args.keep_invalid:
+                if problems and not args.keep_invalid: # drop story if --keep-invalid is not passed
                     stats["invalid_dropped"] += 1
                     print(f"DROPPED {story_id}: {problems}")
                     continue
 
-                out_row = {
+                out_row = { # building the output row
                     "id": story_id,
                     "source_template_id": template_id,
                     **combo,
@@ -186,24 +165,19 @@ def main():
                 }
                 # Carry source-performance metadata through so you can
                 # later weight or filter by how the source video did.
-                for extra_key in ("title", "channel", "views"):
-                    if extra_key in row:
-                        out_row[f"source_{extra_key}"] = row[extra_key]
-                if problems:
+                carry_metadata(row, out_row, prefix="source_")
+                if problems: # if --keep-invalid is passed, it will write the story to the output file with a "problems" field
                     out_row["problems"] = problems
                     stats["invalid_kept"] += 1
 
-                f_out.write(json.dumps(out_row) + "\n")
-                f_out.flush()
+                append_row(f_out, out_row)
                 done_ids.add(story_id)
                 stats["written"] += 1
 
                 if stats["written"] % 25 == 0:
                     print(f"Generated {stats['written']} stories...")
 
-    print("\n--- Pilot summary ---")
-    for k, v in stats.items():
-        print(f"{k:>19}: {v}")
+    print_stats("Pilot summary", stats)
     total_attempted = stats["written"] + stats["invalid_dropped"] + stats["api_failed"]
     if total_attempted:
         print(f"\nClean yield: {stats['written'] / total_attempted * 100:.1f}%")

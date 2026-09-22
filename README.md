@@ -1,6 +1,6 @@
 # YT-AI: A 51M-Parameter Story Model Trained From Scratch to Write Viral YouTube Shorts
 
-<a href="https://colab.research.google.com/github/parthdabhi5195/YT-AI/blob/main/YT_AI.ipynb" target="_parent"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/></a>
+<a href="https://colab.research.google.com/github/parthdabhi5195/YT-AI/blob/main/stage3-model/YT_AI.ipynb" target="_parent"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/></a>
 
 YT-AI is an end-to-end machine learning system that learns the ***structure*** of proven, high-view short-form stories and writes new ones with the same plot skeleton but entirely different characters, settings, and events. It covers the full lifecycle of a language model: a proxy-backed YouTube data scraper, a fault-tolerant synthetic data pipeline that produced **2,441,613 valid training stories** through Gemini Enterprise Agent Platform (GEAP) batch prediction, and a **51.2M-parameter decoder-only transformer** written from scratch in PyTorch and pre-trained on **838.6M tokens** to a validation loss of **2.152**.
 
@@ -27,9 +27,8 @@ YT-AI is an end-to-end machine learning system that learns the ***structure*** o
 8. [How the Model Will Be Used: Hook-Conditioned Generation](#8-how-the-model-will-be-used-hook-conditioned-generation)
 9. [Evaluation Plan: Real YouTube Performance](#9-evaluation-plan-real-youtube-performance)
 10. [Roadmap](#10-roadmap)
-11. [Repository Layout](#11-repository-layout)
-12. [Reproducing the Pipeline](#12-reproducing-the-pipeline)
-13. [Lessons Learned](#13-lessons-learned)
+11. [Reproducing the Pipeline](#11-reproducing-the-pipeline)
+12. [Lessons Learned](#12-lessons-learned)
 
 ---
 
@@ -111,7 +110,7 @@ The three major stages are:
 
 ## 4. Stage 1 — YouTube Scraping
 
-**File:** `scraper.py` (final version; earlier iterations are summarized in [Section 4.3](#43-how-the-scraper-evolved))
+**File:** `stage1-scraping/scraper.py` (final version; earlier iterations are summarized in [Section 4.3](#43-how-the-scraper-evolved))
 
 The scraper walks the Shorts tab of each target channel, keeps only videos that crossed the viral threshold, and saves a clean, punctuated transcript for each one. The final version is a concurrent, proxy-backed, interrupt-safe pipeline that splits network-bound and CPU-bound work into separate phases.
 
@@ -414,7 +413,7 @@ The two v1 batch assumptions would have cost the most. `custom_id` turned out no
 
 ## 6. Stage 3 — Decoder-Only Transformer
 
-**File:** `YT_AI.ipynb` (runs on Google Colab; inference also runs locally)
+**File:** `stage3-model/YT_AI.ipynb` (runs on Google Colab; inference also runs locally)
 
 ### 6.1 Architecture
 
@@ -601,88 +600,59 @@ Loss curves measure how well the model predicts text. They don't measure whether
 
 ---
 
-## 11. Repository Layout
-
-```
-YT-AI/
-├── YT_AI.ipynb                     # Stage 3: tokenization, model, training, inference
-├── config/
-│   └── diversity_pools.json        # settings, relationships, incident seeds, occupations, hooks, names
-├── scripts/
-│   ├── scraper.py                  # Stage 1: concurrent YouTube Shorts transcript scraper
-│   ├── prepare_source_data.py      # 2.0  normalize scraper exports
-│   ├── extract_templates.py        # 2.1  proven script → structural template
-│   ├── pilot_generate.py           # 2.2  small real-time generation run
-│   ├── check_diversity.py          # 2.2b embedding-based mode-collapse check
-│   ├── build_batch_requests.py     # 2.3  templates × combos → batch JSONL chunks
-│   ├── submit_batch_job.py         # 2.4  GCS upload, GEAP batch job, download
-│   ├── clean_dataset.py            # 2.5  join, validate, MinHash dedup
-│   ├── salvage_rejects.py          # 2.5b recover fixable rejects
-│   ├── prompts.py                  # shared prompts + JSON schema
-│   ├── validation.py               # shared template/story validators
-│   ├── diversity_sampler.py        # shuffle-cycle combo sampler
-│   ├── batch_schema.py             # batch request contract
-│   ├── gemini_io.py                # retry policy + fatal-error detection
-│   └── pipeline_io.py              # JSONL I/O, resume, crash repair
-└── assets/
-    └── loss_curve.png
-```
-
----
-
-## 12. Reproducing the Pipeline
+## 11. Reproducing the Pipeline
 
 ```bash
 # Stage 1: scrape (set WEBSHARE_USER / WEBSHARE_PASS first)
-python scripts/scraper.py
+python stage1-scraping/scraper.py
 
 # Stage 2.0: normalize exports
-python scripts/prepare_source_data.py \
+python stage2-pipeline/scripts/prepare_source_data.py \
     --inputs data/source_scripts/@channelA.jsonl data/source_scripts/@channelB.jsonl \
     --output data/source_scripts/source_scripts.jsonl
 
 # Stage 2.1: extract templates (start small)
-python scripts/extract_templates.py \
+python stage2-pipeline/scripts/extract_templates.py \
     --input data/source_scripts/source_scripts.jsonl \
     --output data/templates/templates.jsonl \
     --project YOUR_PROJECT_ID --limit 50
 
 # Stage 2.2: pilot + diversity check
-python scripts/pilot_generate.py \
+python stage2-pipeline/scripts/pilot_generate.py \
     --templates data/templates/templates.jsonl \
     --output data/pilot_output/pilot.jsonl \
     --project YOUR_PROJECT_ID --variants-per-template 15 --max-templates 100
-python scripts/check_diversity.py --input data/pilot_output/pilot.jsonl
+python stage2-pipeline/scripts/check_diversity.py --input data/pilot_output/pilot.jsonl
 
 # Stage 2.3: build batch chunks
-python scripts/build_batch_requests.py \
+python stage2-pipeline/scripts/build_batch_requests.py \
     --templates data/templates/templates.jsonl \
     --output-dir data/batch_requests \
     --target-total 2000000 --chunk-size 50000 --seed 42
 
 # Stage 2.4: submit ONE chunk at a time (dry-run first)
-python scripts/submit_batch_job.py \
+python stage2-pipeline/scripts/submit_batch_job.py \
     --input-jsonl data/batch_requests/requests_chunk_0000.jsonl \
     --bucket YOUR_BUCKET --project YOUR_PROJECT_ID \
     --chunk-name chunk_0000 --dry-run
 
 # Stage 2.5: clean, then salvage
-python scripts/clean_dataset.py \
+python stage2-pipeline/scripts/clean_dataset.py \
     --batch-results-dir data/batch_results \
     --metadata data/batch_requests/request_metadata.jsonl \
     --output data/clean/stories_clean.jsonl \
     --rejects-output data/clean/rejects.jsonl
-python scripts/salvage_rejects.py \
+python stage2-pipeline/scripts/salvage_rejects.py \
     --rejects data/clean/rejects.jsonl \
     --clean data/clean/stories_clean.jsonl \
     --output data/clean/salvaged.jsonl
 
-# Stage 3: open YT_AI.ipynb in Colab and run top to bottom
+# Stage 3: open stage3-model/YT_AI.ipynb in Colab and run top to bottom
 ```
 
 ---
 
-## 13. Lessons Learned
+## 12. Lessons Learned
 
 * **Profile before optimizing.** The scraper went from sleeping 15 to 20 seconds per video on one IP to 6 concurrent proxy-backed workers, but the biggest single fix was noticing that CPU-bound punctuation inference was blocking the network loop.
 * **Data engineering was most of the work.** The transformer is a few hundred lines. The pipeline that produced its data, with resume logic, dual join keys, chunk audits, crash repair, and salvage, is where almost all of the real problems showed up.

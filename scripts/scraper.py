@@ -1,193 +1,266 @@
-import yt_dlp
-import pandas as pd
 import os
-import requests
-import time
-import random
 import json
 import re
-from datetime import datetime
+import time
+import random
+import logging
+import hashlib
+import requests
+import html
+import yt_dlp
+from deepmultilingualpunctuation import PunctuationModel
 
-# ==========================================
-# 1. SETUP 
-# ==========================================
-CHANNEL_URL = "https://www.youtube.com/@Requestedreads/shorts"
-
+# ==============================================================================
+# CONFIGURATION
+# ==============================================================================
 BASE_DIR = r"C:\Users\parth\Desktop\Youtube\YouTube Account (TheUnfilteredTales)\Revived\RequestedReads"
-EXCEL_FILE = os.path.join(BASE_DIR, "Master_YouTube_Analysis.xlsx")
-QUEUE_FILE = os.path.join(BASE_DIR, "queue.json")
+LOG_FILE = os.path.join(BASE_DIR, "scraper.log")
 
-def extract_video_id(url):
-    """Extracts the exact 11-character YouTube video ID to prevent format mismatches."""
-    match = re.search(r'(?:v=|shorts\/|youtu\.be\/)([A-Za-z0-9_-]{11})', str(url))
-    return match.group(1) if match else str(url)
+# --- Webshare.io Rotating Residential Proxy ---
+PROXY_USER = os.environ.get("WEBSHARE_USER", "username")
+PROXY_PASS = os.environ.get("WEBSHARE_PASS", "password")
+PROXY_HOST = "p.webshare.io"
+PROXY_PORT = 80
+PROXY_URL = f"http://{PROXY_USER}:{PROXY_PASS}@{PROXY_HOST}:{PROXY_PORT}"
 
-# ==========================================
-# 2. CORE FUNCTIONS
-# ==========================================
-def format_time(seconds):
-    if seconds is None: return "0:00"
-    mins = int(seconds // 60)
-    secs = int(seconds % 60)
-    return f"{mins}:{secs:02d}"
+CHANNELS = [
+    "https://www.youtube.com/@Requestedreads/shorts",
+    # Add more channels here
+]
 
-def get_transcript_manually(info, url):
-    try:
-        subs = info.get('subtitles', {})
-        auto_subs = info.get('automatic_captions', {})
-        target_sub = subs.get('en') or auto_subs.get('en')
-        if not target_sub: return "Transcript extraction failed: No English transcript found."
-        
-        sub_url = next((s['url'] for s in target_sub if s.get('ext') == 'json3'), target_sub[0]['url'])
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-            'Referer': 'https://www.youtube.com/'
-        }
-        response = requests.get(sub_url, headers=headers, timeout=15)
-        
-        if response.status_code != 200: return f"Transcript extraction failed: Error {response.status_code}"
-        
-        data = response.json()
-        lines = [f"[{format_time(e.get('tStartMs', 0)/1000)}] {''.join([s['utf8'] for s in e['segs'] if 'utf8' in s]).strip()}" for e in data.get('events', []) if 'segs' in e]
-        return "\n".join(lines)
-    except Exception as e:
-        return "Transcript extraction failed: YouTube blocked data (429/CAPTCHA)."
+MIN_VIEWS = 50_000
 
-def get_shorts_data(url):
-    ydl_opts = {'quiet': True, 'no_warnings': True, 'skip_download': True, 'user_agent': 'Mozilla/5.0'}
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        try:
-            info = ydl.extract_info(url, download=False)
-            print(f"Fetching data for: {info.get('title')}")
-            ts = info.get('timestamp')
-            p_time = datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S') if ts else datetime.strptime(info.get('upload_date'), '%Y%m%d').strftime('%Y-%m-%d 00:00:00')
-            return {
-                "Title": info.get('title'), "Duration": format_time(info.get('duration')),
-                "Upload Date/Time": p_time, "Views": info.get('view_count'),
-                "Likes": info.get('like_count'), "Comments": info.get('comment_count'),
-                "Transcript": get_transcript_manually(info, url), "URL": url
-            }
-        except Exception as e:
-            print(f"Error scraping {url}: {e}")
-            return None
+# Accepted English subtitle-track key prefixes, in priority order.
+ENGLISH_KEYS_PRIORITY = ("en", "en-orig", "en-US", "en-GB", "en-CA", "en-AU")
 
-# ==========================================
-# 3. AUTOMATION & AUTO-CLEANER
-# ==========================================
-def build_delta_queue():
-    print("\n[PHASE 1] Performing High-Speed Delta Sync & Checking for Duplicates...")
+# ==============================================================================
+# INITIALIZATION
+# ==============================================================================
+def setup_logging():
+    os.makedirs(BASE_DIR, exist_ok=True)
+    logger = logging.getLogger("scraper")
+    logger.setLevel(logging.INFO)
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%H:%M:%S")
     
-    existing_ids = set()
-    if os.path.exists(EXCEL_FILE):
+    stream = logging.StreamHandler()
+    stream.setFormatter(fmt)
+    logger.addHandler(stream)
+    
+    file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
+    file_handler.setFormatter(fmt)
+    logger.addHandler(file_handler)
+    
+    return logger
+
+log = setup_logging()
+
+log.info("Loading punctuation restoration model... This may take a moment.")
+punct_model = PunctuationModel()
+log.info("Punctuation model loaded successfully.")
+
+# ==============================================================================
+# DATA SERIALIZATION & STATE
+# ==============================================================================
+def load_processed_ids(filepath):
+    """Loads processed Video IDs into an O(1) set from the JSONL file."""
+    processed = set()
+    if os.path.exists(filepath):
+        with open(filepath, 'r', encoding='utf-8') as f:
+            for line in f:
+                if line.strip():
+                    try:
+                        vid = json.loads(line).get('VideoID')
+                        if vid:
+                            processed.add(vid)
+                    except json.JSONDecodeError:
+                        continue
+    return processed
+
+def append_to_jsonl(filepath, record):
+    """Incrementally writes a single record to prevent data loss on crash."""
+    with open(filepath, 'a', encoding='utf-8') as f:
+        f.write(json.dumps(record, ensure_ascii=False) + '\n')
+
+# ==============================================================================
+# PROXY HELPERS
+# ==============================================================================
+def sticky_proxy_for(video_id: str) -> str:
+    """
+    Plain rotating proxy by default. Pass a video ID as sticky_key to pin
+    that video's metadata + subtitle requests to the same residential IP.
+    """
+    numeric_session = int(hashlib.md5(video_id.encode()).hexdigest()[:8], 16) % 1000000
+    return f"http://{PROXY_USER}-us-{numeric_session}:{PROXY_PASS}@{PROXY_HOST}:{PROXY_PORT}"
+
+# ==============================================================================
+# EXTRACTION & CLEANING
+# ==============================================================================
+def _find_english_track(subs: dict, auto_subs: dict):
+    """Returns (track_list, source_label) for the best available English track."""
+    for source, label in ((subs, "manual"), (auto_subs, "auto")):
+        if not source:
+            continue
+        for key in ENGLISH_KEYS_PRIORITY:
+            if key in source:
+                return source[key], f"{label}:{key}"
+        for key in source:
+            if key.startswith("en"):
+                return source[key], f"{label}:{key}"
+    return None, None
+
+def fetch_transcript_in_memory(info, proxy_url):
+    """Fetches JSON3 transcript via requests using the rotating sticky proxy."""
+    subs = info.get('subtitles', {}) or {}
+    auto_subs = info.get('automatic_captions', {}) or {}
+    target_sub, source_label = _find_english_track(subs, auto_subs)
+    
+    if not target_sub:
+        return None
+
+    json3_entry = next((s for s in target_sub if s.get('ext') == 'json3'), None)
+    if not json3_entry:
+        log.debug("No json3 track available (source=%s)", source_label)
+        return None
+
+    sub_url = json3_entry['url']
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept-Language': 'en-US,en;q=0.9',
+    }
+    proxies = {"http": proxy_url, "https": proxy_url}
+
+    for attempt in range(1, 4):
         try:
-            df = pd.read_excel(EXCEL_FILE)
-            if 'URL' in df.columns:
-                # Use exact Video IDs to find duplicates
-                df['VideoID'] = df['URL'].apply(extract_video_id)
-                existing_ids = set(df['VideoID'].tolist())
+            response = requests.get(sub_url, headers=headers, proxies=proxies, timeout=12)
+            if response.status_code == 200:
+                try:
+                    data = response.json()
+                except ValueError:
+                    log.warning("Subtitle response wasn't valid JSON (source=%s)", source_label)
+                    return None
                 
-                # AUTO-CLEANER: If the file has more rows than unique IDs, it cleans the file instantly.
-                if len(df) > len(existing_ids):
-                    print(f" -> [!] Found {len(df) - len(existing_ids)} duplicate entries from format mismatch. Auto-cleaning the Master file...")
-                    df.drop_duplicates(subset=['VideoID'], keep='last', inplace=True)
-                    df.drop(columns=['VideoID'], inplace=True)
-                    df.to_excel(EXCEL_FILE, index=False)
-                    print(" -> [✓] Master file successfully cleaned!")
+                lines = []
+                for event in data.get('events', []):
+                    if 'segs' not in event:
+                        continue
+                    segment_text = ''.join(s.get('utf8', '') for s in event['segs'])
                     
-            print(f" -> Found {len(existing_ids)} unique videos already in Master Excel.")
-        except: pass
-
-    ydl_opts = {'extract_flat': True, 'quiet': True, 'no_warnings': True}
-    print(" -> Fetching complete channel list from YouTube...")
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(CHANNEL_URL, download=False)
-        all_urls = [f"https://www.youtube.com/watch?v={e['id']}" for e in info.get('entries', [])]
-
-    # Filter out what we already have using the strict 11-Character ID
-    new_urls = [u for u in all_urls if extract_video_id(u) not in existing_ids]
-    
-    if not new_urls:
-        print("\n[✓] Excel sheet is completely up to date. No new videos to scrape.")
-        return False
-
-    chunks = [new_urls[i:i + 9] for i in range(0, len(new_urls), 9)]
-    with open(QUEUE_FILE, "w") as f: json.dump(chunks, f)
-    print(f"\nSUCCESS: Found {len(new_urls)} entirely new videos. Built {len(chunks)} batches.")
-    return True
-
-def run_automated_batch():
-    with open(QUEUE_FILE, "r") as f: queue = json.load(f)
-    if not queue: return
-
-    current_batch = queue[0]
-    print(f"\n--- [PHASE 2] STARTING BATCH OF {len(current_batch)}. {len(queue)-1} batches remain. ---")
-    
-    results = []
-    for i, url in enumerate(current_batch):
-        data = get_shorts_data(url)
-        
-        if data:
-            if "Transcript extraction failed" in data["Transcript"]:
-                print(f"\n[!!!] FATAL ABORT [!!!]")
-                print("YouTube blocked the transcript. Your IP is flagged (429 Error).")
-                print("ABORTING batch to protect Excel file. Toggle Hotspot to reset IP.")
-                exit(1) 
-
-            results.append(data)
-        
-        if i < len(current_batch) - 1:
-            if (i + 1) % 3 == 0:
-                cooldown = random.uniform(60, 120)
-                print(f"Taking a long 'Human Break' ({cooldown:.2f}s)...")
-                time.sleep(cooldown)
-            else:
-                wait_time = random.uniform(15, 20)
-                print(f"Sleeping for {wait_time:.2f} seconds...")
-                time.sleep(wait_time)
-
-    if not results: return
-    new_data = pd.DataFrame(results)
-
-    try:
-        if os.path.exists(EXCEL_FILE):
-            existing_df = pd.read_excel(EXCEL_FILE)
-            cols_to_remove = ['Upload Date', 'Upload Time']
-            existing_df = existing_df.drop(columns=[c for c in cols_to_remove if c in existing_df.columns])
-            final_df = pd.concat([existing_df, new_data], ignore_index=True)
-        else:
-            final_df = new_data
-
-        # Final Sort & Strict VideoID Cleanup
-        final_df['VideoID'] = final_df['URL'].apply(extract_video_id)
-        final_df.drop_duplicates(subset=['VideoID'], keep='last', inplace=True)
-        
-        final_df['Upload Date/Time'] = pd.to_datetime(final_df['Upload Date/Time'], errors='coerce')
-        final_df = final_df.dropna(subset=['Upload Date/Time'])
-        final_df.sort_values(by='Upload Date/Time', ascending=False, inplace=True)
-        final_df['Upload Date/Time'] = final_df['Upload Date/Time'].dt.strftime('%Y-%m-%d %H:%M:%S')
-        
-        # Remove Temp ID Column and Save
-        final_df = final_df.drop(columns=['VideoID'])
-        final_df = final_df.reindex(columns=["Title", "Duration", "Upload Date/Time", "Views", "Likes", "Comments", "Transcript", "URL"])
-
-        final_df.to_excel(EXCEL_FILE, index=False)
-        print(f"\nSUCCESS! Added {len(results)} new videos. Master file updated.")
-        
-        queue.pop(0)
-        with open(QUEUE_FILE, "w") as f: json.dump(queue, f)
+                    # Clean the text: remove brackets, fix spacing, unescape HTML
+                    clean_text = re.sub(r'\[.*?\]|\(.*?\)', '', segment_text)
+                    clean_text = re.sub(r'\s+', ' ', clean_text).strip()
+                    clean_text = html.unescape(clean_text)
+                    
+                    if clean_text:
+                        lines.append(clean_text)
+                        
+                final_text = " ".join(lines)
+                
+                # Restore punctuation if the string is not empty
+                if final_text.strip():
+                    return punct_model.restore_punctuation(final_text)
+                return None
+                
+            log.debug("Subtitle fetch got HTTP %s (attempt %d)", response.status_code, attempt)
+            time.sleep(2 ** attempt + random.uniform(1.0, 3.0))
+        except requests.RequestException as e:
+            log.debug("Subtitle fetch error: %s (attempt %d)", e, attempt)
+            time.sleep(1.5)
             
-    except PermissionError:
-        print("\n--- FATAL ERROR --- The Excel file is currently OPEN!")
-        print("You must CLOSE Excel for the script to save data.")
-        exit(1)
-    except Exception as e:
-        print(f"An error occurred during save: {e}")
-        exit(1)
+    return None
+
+# ==============================================================================
+# PIPELINE EXECUTION
+# ==============================================================================
+def process_channels(channels):
+    os.makedirs(BASE_DIR, exist_ok=True)
+    
+    ydl_opts_flat = {
+        'extract_flat': True,
+        'quiet': True,
+        'no_warnings': True,
+        'ignoreerrors': True,
+        'proxy': PROXY_URL,
+    }
+
+    for channel_url in channels:
+        log.info("Scanning channel: %s", channel_url)
+        
+        # Robust regex parsing for the channel handle
+        match = re.search(r'(@[\w-]+)', channel_url)
+        channel_handle = match.group(1) if match else "Unknown_Channel"
+            
+        channel_file = os.path.join(BASE_DIR, f"{channel_handle}.jsonl")
+        existing_ids = load_processed_ids(channel_file)
+        log.info("Loaded %d previously processed videos for %s.", len(existing_ids), channel_handle)
+
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts_flat) as ydl_flat:
+                channel_info = ydl_flat.extract_info(channel_url, download=False)
+        except Exception as e:
+            log.error("Failed to fetch channel %s: %s", channel_url, e)
+            continue
+
+        if not channel_info:
+            log.error("Channel extraction returned nothing for %s", channel_url)
+            continue
+
+        all_entries = [e for e in (channel_info.get('entries') or []) if e]
+        
+        # Pre-filter candidate videos (excluding view count check to avoid extract_flat bugs)
+        candidate_entries = [
+            e for e in all_entries
+            if e.get('id') not in existing_ids
+        ]
+        
+        log.info("Found %d valid candidates to process.", len(candidate_entries))
+
+        for idx, entry in enumerate(candidate_entries, 1):
+            vid_id = entry['id']
+            url = f"https://www.youtube.com/watch?v={vid_id}"
+            proxy_for_video = sticky_proxy_for(vid_id)
+            
+            video_opts = {
+                'quiet': True,
+                'no_warnings': True,
+                'skip_download': True,
+                'proxy': proxy_for_video,
+                'writesubtitles': False,
+            }
+            
+            try:
+                with yt_dlp.YoutubeDL(video_opts) as ydl_video:
+                    info = ydl_video.extract_info(url, download=False)
+                    
+                # View count check moved here where metadata is fully loaded
+                views = info.get('view_count') or 0
+                if views < MIN_VIEWS:
+                    log.info("Skipped (%d/%d): %s has %d views (below threshold)", idx, len(candidate_entries), vid_id, views)
+                    continue
+                    
+                transcript = fetch_transcript_in_memory(info, proxy_for_video)
+                
+                if transcript:
+                    title = info.get('title') or ""
+                    record = {
+                        "VideoID": vid_id,
+                        "Channel": channel_info.get('channel') or channel_info.get('uploader', 'Unknown'),
+                        "Title": title,
+                        "Duration": info.get('duration'),
+                        "Views": views,
+                        "Transcript": transcript
+                    }
+                    
+                    append_to_jsonl(channel_file, record)
+                    existing_ids.add(vid_id)
+                    log.info("Saved (%d/%d): %s...", idx, len(candidate_entries), title[:45])
+                else:
+                    log.info("No transcript for: %s", url)
+                    
+            except Exception as e:
+                log.error("Failed %s: %s", url, e)
+
+            # Delay to avoid channel-level rate limits
+            time.sleep(random.uniform(1.2, 2.8))
 
 if __name__ == "__main__":
-    if not os.path.exists(QUEUE_FILE) or os.path.getsize(QUEUE_FILE) <= 2: 
-        if not build_delta_queue(): exit()
-    
-    run_automated_batch()
+    process_channels(CHANNELS)

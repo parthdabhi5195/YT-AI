@@ -1,6 +1,6 @@
 # YT-AI: A 51M-Parameter Story Model Trained From Scratch to Write Viral YouTube Shorts
 
-<a href="https://colab.research.google.com/github/parthdabhi5195/YT-AI/blob/restructure/stage3-model/YT_AI.ipynb" target="_parent"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/></a>
+<a href="https://colab.research.google.com/github/parthdabhi5195/YT-AI/blob/main/stage3-model/YT_AI.ipynb" target="_parent"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/></a>
 
 YT-AI is an end-to-end machine learning system that learns the ***structure*** of proven, high-view short-form stories and writes new ones with the same plot skeleton but entirely different characters, settings, and events. It covers the full lifecycle of a language model: a proxy-backed YouTube data scraper, a fault-tolerant synthetic data pipeline that produced **2,441,613 valid training stories** through Gemini Enterprise Agent Platform (GEAP) batch prediction, and a **51.2M-parameter decoder-only transformer** written from scratch in PyTorch and pre-trained on **838.6M tokens** to a validation loss of **2.152**.
 
@@ -603,6 +603,10 @@ Loss curves measure how well the model predicts text. They don't measure whether
 ## 11. Reproducing the Pipeline
 
 ```bash
+# Setup (run once)
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+
 # Stage 1: scrape (set WEBSHARE_USER / WEBSHARE_PASS first)
 python stage1-scraping/scraper.py
 

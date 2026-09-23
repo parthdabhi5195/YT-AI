@@ -14,7 +14,7 @@ YT-AI is an end-to-end machine learning system that learns the ***structure*** o
 | **Stack** | PyTorch, tiktoken, Hugging Face `datasets`, Google Enterprise Agent AI (Gemini 2.5 Flash-Lite, batch prediction), Google Cloud Storage, yt-dlp, datasketch (MinHash LSH), sentence-transformers |
 
 ---
-## 0. Example Output
+## Example Output
 
 ### YT-AI Generated Story
 
